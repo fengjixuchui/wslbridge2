@@ -1,20 +1,17 @@
 /* 
  * This file is part of wslbridge2 project.
  * Licensed under the terms of the GNU General Public License v3 or later.
- * Copyright (C) 2019-2020 Biswapriyo Nath.
+ * Copyright (C) 2019-2021 Biswapriyo Nath.
  */
 
-/* DO NOT include winsock.h, conflicts with poll.h. */
+#include <winsock2.h>
 #include <windows.h>
 #include <assert.h>
 #include <getopt.h>
-#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
-#ifdef __CYGWIN__
 #include <sys/cygwin.h>
-#endif
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -35,18 +32,12 @@
 #define ARRAYSIZE(a) (sizeof(a)/sizeof((a)[0]))
 #endif
 
-extern "C" {
-WINBASEAPI int WINAPI closesocket(SOCKET s);
-WINBASEAPI int WINAPI recv(SOCKET s, void *buf, int len, int flags);
-WINBASEAPI int WINAPI send(SOCKET s, void *buf, int len, int flags);
-WINBASEAPI int WINAPI WSACleanup(void);
-}
-
 union IoSockets
 {
-    SOCKET sock[3];
+    SOCKET sock[4];
     struct
     {
+        SOCKET xserverSock;
         SOCKET inputSock;
         SOCKET outputSock;
         SOCKET controlSock;
@@ -54,7 +45,7 @@ union IoSockets
 };
 
 /* global variable */
-static volatile union IoSockets g_ioSockets = { 0, 0, 0 };
+static volatile union IoSockets g_ioSockets = { 0 };
 
 static void resize_window(int signum)
 {
@@ -62,7 +53,7 @@ static void resize_window(int signum)
 
     /* Send terminal window size to control socket */
     ioctl(STDIN_FILENO, TIOCGWINSZ, &winp);
-    send(g_ioSockets.controlSock, &winp, sizeof winp, 0);
+    send(g_ioSockets.controlSock, (char *)&winp, sizeof winp, 0);
 }
 
 static void* send_buffer(void *param)
@@ -70,20 +61,16 @@ static void* send_buffer(void *param)
     int ret;
     char data[1024];
 
-    struct pollfd fds = { STDIN_FILENO, POLLIN, 0 };
-
     while (1)
     {
-        ret = poll(&fds, 1, -1);
-
-        if (fds.revents & POLLIN)
+        ret = read(STDIN_FILENO, data, sizeof data);
+        if (ret < 0)
         {
-            ret = read(STDIN_FILENO, data, sizeof data);
-            if (ret > 0)
-                ret = send(g_ioSockets.inputSock, data, ret, 0);
-            else
-                break;
+            closesocket(g_ioSockets.inputSock);
+            break;
         }
+        if (!send(g_ioSockets.inputSock, data, ret, 0))
+            break;
     }
 
     pthread_exit(&ret);
@@ -98,20 +85,21 @@ static void* receive_buffer(void *param)
     while (1)
     {
         ret = recv(g_ioSockets.outputSock, data, sizeof data, 0);
-        if (ret > 0)
-            ret = write(STDOUT_FILENO, data, ret);
-        else
+        if (ret <= 0)
             break;
+
+        if(!write(STDOUT_FILENO, data, ret))
+        {
+            shutdown(g_ioSockets.outputSock, SD_BOTH);
+            break;
+        }
     }
 
     pthread_exit(&ret);
     return nullptr;
 }
 
-struct PipeHandles {
-    HANDLE rh;
-    HANDLE wh;
-};
+struct PipeHandles { HANDLE rh, wh; };
 
 static struct PipeHandles createPipe(void)
 {
@@ -139,14 +127,16 @@ static void usage(const char *prog)
     "  -e VAR=VAL    Sets VAR to VAL in the WSL environment.\n"
     "  -h, --help    Show this usage information\n"
     "  -l, --login   Start a login shell.\n"
+    "  -s, --show    Shows hidden backend window and debug output.\n"
     "  -u, --user    WSL User Name\n"
     "                Run as the specified user\n"
     "  -w, --windir  Folder\n"
     "                Changes the working directory to Windows style path\n"
     "  -W, --wsldir  Folder\n"
     "                Changes the working directory to Unix style path\n"
-    "  -x, --xmod    Shows hidden backend window and debug output.\n"
+    "  -x, --xmod    Enables X11 forwarding.\n"
     , prog);
+
     exit(0);
 }
 
@@ -161,9 +151,7 @@ int main(int argc, char *argv[])
     if (GetWindowsBuild() < 17763)
         fatal("Windows 10 version is older than minimal requirement.\n");
 
-#ifdef __CYGWIN__
     cygwin_internal(CW_SYNC_WINENV);
-#endif
 
     /*
      * Set time as seed for generation of random port.
@@ -176,30 +164,27 @@ int main(int argc, char *argv[])
     srand(seed);
 
     int ret;
-    const char shortopts[] = "+b:d:e:hlu:w:W:V:x";
+    const char shortopts[] = "+b:d:e:hlsu:V:w:W:x";
     const struct option longopts[] = {
         { "backend",       required_argument, 0, 'b' },
         { "distribution",  required_argument, 0, 'd' },
         { "env",           required_argument, 0, 'e' },
         { "help",          no_argument,       0, 'h' },
         { "login",         no_argument,       0, 'l' },
+        { "show",          required_argument, 0, 's' },
         { "user",          required_argument, 0, 'u' },
+        { "wslver",        required_argument, 0, 'V' },
         { "windir",        required_argument, 0, 'w' },
         { "wsldir",        required_argument, 0, 'W' },
-        { "wslver",        required_argument, 0, 'V' },
         { "xmod",          no_argument,       0, 'x' },
         { 0,               no_argument,       0,  0  },
     };
 
     class Environment env;
     class TerminalState termState;
-    std::string distroName;
-    std::string customBackendPath;
-    std::string winDir;
-    std::string wslDir;
-    std::string userName;
-    bool debugMode = false;
-    bool loginMode = false;
+    std::string distroName, customBackendPath;
+    std::string winDir, wslDir, userName;
+    volatile bool debugMode = false, loginMode = false, xservMode = false;
 
     if (argv[0][0] == '-')
         loginMode = true;
@@ -241,20 +226,17 @@ int main(int argc, char *argv[])
                 break;
             }
 
-            case 'h':
-                usage(argv[0]);
-                break;
-
-
-            case 'l':
-                loginMode = true;
-                break;
+            case 'h': usage(argv[0]); break;
+            case 'l': loginMode = true; break;
+            case 's': debugMode = true; break;
 
             case 'u':
                 userName = optarg;
                 if (userName.empty())
                     invalid_arg("user");
                 break;
+
+            case 'V': break; /* empty */
 
             case 'w':
                 winDir = optarg;
@@ -268,13 +250,7 @@ int main(int argc, char *argv[])
                     invalid_arg("wsldir");
                 break;
 
-            case 'V':
-                /* empty */
-                break;
-
-            case 'x':
-                debugMode = true;
-                break;
+            case 'x': xservMode = true; break;
 
             default:
                 fatal("Try '%s --help' for more information.\n", argv[0]);
@@ -338,8 +314,9 @@ int main(int argc, char *argv[])
         ret = swprintf(
                 buffer.data(),
                 buffer.size(),
-                L" %ls--cols %d --rows %d --port %d",
-                debugMode ? L"--xmod " : L"",
+                L" %ls%ls--cols %d --rows %d --port %d",
+                debugMode ? L"--show " : L"",
+                xservMode ? L"--xmod " : L"",
                 winp.ws_col,
                 winp.ws_row,
                 ListenHvSock(serverSock, &VmId));
@@ -360,12 +337,12 @@ int main(int argc, char *argv[])
                 buffer.data(),
                 buffer.size(),
                 L" %ls--cols %d --rows %d -0%d -1%d -3%d",
-                debugMode ? L"--xmod " : L"",
+                debugMode ? L"--show " : L"",
                 winp.ws_col,
                 winp.ws_row,
-                ListenLocSock(inputSocket),
-                ListenLocSock(outputSocket),
-                ListenLocSock(controlSocket));
+                ListenLocSock(inputSocket, 0),
+                ListenLocSock(outputSocket, 0),
+                ListenLocSock(controlSocket, 0));
         assert(ret > 0);
         wslCmdLine.append(buffer.data());
     }
@@ -463,7 +440,8 @@ int main(int argc, char *argv[])
     if (!ret)
         fatal("SetHandleInformation: %s", GetErrorMessage(GetLastError()).c_str());
 
-    const auto watchdog = std::thread([&]() {
+    std::thread watchdog([&]()
+    {
         WaitForSingleObject(pi.hProcess, INFINITE);
 
         std::vector<char> outVec = readAllFromHandle(outputPipe.rh);
@@ -493,7 +471,7 @@ int main(int argc, char *argv[])
         const SOCKET sClient = AcceptHvSock(serverSock);
 
         int randomPort = 0;
-        ret = recv(sClient, &randomPort, sizeof randomPort, 0);
+        ret = recv(sClient, (char *)&randomPort, sizeof randomPort, 0);
         assert(ret > 0);
         closesocket(sClient);
 
